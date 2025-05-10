@@ -44,3 +44,10 @@ ENV/
 
 # Kalshi specific
 *KEYFILE* 
+*.pem
+*.key
+*.crt
+*.csr
+*.csr.pem
+*.csr.pem.crt
+*.csr.pem.key
