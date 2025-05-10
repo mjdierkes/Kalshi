@@ -1,10 +1,12 @@
 import requests
 import base64
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List, Callable
 from datetime import datetime, timedelta
 from enum import Enum
 import json
+import asyncio
+import concurrent.futures
 
 from requests.exceptions import HTTPError
 
@@ -25,6 +27,7 @@ class KalshiBaseClient:
         key_id: str,
         private_key: rsa.RSAPrivateKey,
         environment: Environment = Environment.DEMO,
+        max_workers: int = 10
     ):
         """Initializes the client with the provided API key and private key.
 
@@ -32,11 +35,15 @@ class KalshiBaseClient:
             key_id (str): Your Kalshi API key ID.
             private_key (rsa.RSAPrivateKey): Your RSA private key.
             environment (Environment): The API environment to use (DEMO or PROD).
+            max_workers (int): Maximum number of worker threads for parallel requests.
         """
         self.key_id = key_id
         self.private_key = private_key
         self.environment = environment
         self.last_api_call = datetime.now()
+        self.max_workers = max_workers
+        self.rate_limit_lock = asyncio.Lock() if asyncio.get_event_loop_policy().get_event_loop().is_running() else None
+        self.thread_executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
 
         if self.environment == Environment.DEMO:
             self.HTTP_BASE_URL = "https://demo-api.kalshi.co"
@@ -89,23 +96,43 @@ class KalshiHttpClient(KalshiBaseClient):
         key_id: str,
         private_key: rsa.RSAPrivateKey,
         environment: Environment = Environment.DEMO,
+        max_workers: int = 10,
+        rate_limit_ms: int = 50  # More aggressive rate limit
     ):
-        super().__init__(key_id, private_key, environment)
+        super().__init__(key_id, private_key, environment, max_workers)
         self.host = self.HTTP_BASE_URL
         self.exchange_url = "/trade-api/v2/exchange"
         self.markets_url = "/trade-api/v2/markets"
         self.portfolio_url = "/trade-api/v2/portfolio"
         self.events_url = "/trade-api/v2/events"
+        self.rate_limit_ms = rate_limit_ms
+        self._session = requests.Session()  # Use a session for connection pooling
+        self._last_requests = []  # Track the timestamps of last N requests
+
+    def _adaptive_rate_limit(self) -> None:
+        """Adaptive rate limiter that adjusts based on recent request history."""
+        now = datetime.now()
+        # Keep only timestamps from the last second
+        self._last_requests = [ts for ts in self._last_requests if (now - ts).total_seconds() < 1.0]
+        
+        # Add current timestamp
+        self._last_requests.append(now)
+        
+        # If we have more than 15 requests in the last second, slow down
+        if len(self._last_requests) > 15:
+            time.sleep(self.rate_limit_ms / 1000)
+
+    async def async_rate_limit(self) -> None:
+        """Asynchronous rate limiter for use with async functions."""
+        if self.rate_limit_lock:
+            async with self.rate_limit_lock:
+                self._adaptive_rate_limit()
+        else:
+            self._adaptive_rate_limit()
 
     def rate_limit(self) -> None:
-        """Built-in rate limiter to prevent exceeding API rate limits."""
-        THRESHOLD_IN_MILLISECONDS = 100
-        now = datetime.now()
-        threshold_in_microseconds = 1000 * THRESHOLD_IN_MILLISECONDS
-        threshold_in_seconds = THRESHOLD_IN_MILLISECONDS / 1000
-        if now - self.last_api_call < timedelta(microseconds=threshold_in_microseconds):
-            time.sleep(threshold_in_seconds)
-        self.last_api_call = datetime.now()
+        """Non-async version of rate limiter."""
+        self._adaptive_rate_limit()
 
     def raise_if_bad_response(self, response: requests.Response) -> None:
         """Raises an HTTPError if the response status code indicates an error."""
@@ -115,7 +142,7 @@ class KalshiHttpClient(KalshiBaseClient):
     def post(self, path: str, body: dict) -> Any:
         """Performs an authenticated POST request to the Kalshi API."""
         self.rate_limit()
-        response = requests.post(
+        response = self._session.post(
             self.host + path,
             json=body,
             headers=self.request_headers("POST", path)
@@ -126,7 +153,7 @@ class KalshiHttpClient(KalshiBaseClient):
     def get(self, path: str, params: Dict[str, Any] = {}) -> Any:
         """Performs an authenticated GET request to the Kalshi API."""
         self.rate_limit()
-        response = requests.get(
+        response = self._session.get(
             self.host + path,
             headers=self.request_headers("GET", path),
             params=params
@@ -137,13 +164,85 @@ class KalshiHttpClient(KalshiBaseClient):
     def delete(self, path: str, params: Dict[str, Any] = {}) -> Any:
         """Performs an authenticated DELETE request to the Kalshi API."""
         self.rate_limit()
-        response = requests.delete(
+        response = self._session.delete(
             self.host + path,
             headers=self.request_headers("DELETE", path),
             params=params
         )
         self.raise_if_bad_response(response)
         return response.json()
+        
+    def batch_get(self, paths: List[str], params_list: Optional[List[Dict[str, Any]]] = None) -> List[Any]:
+        """Performs multiple GET requests in parallel using a thread pool.
+        
+        Args:
+            paths: List of API paths to request
+            params_list: Optional list of params dictionaries for each request
+        
+        Returns:
+            List of API responses
+        """
+        if params_list is None:
+            params_list = [{} for _ in paths]
+            
+        if len(paths) != len(params_list):
+            raise ValueError("paths and params_list must have the same length")
+            
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = [
+                executor.submit(self.get, path, params)
+                for path, params in zip(paths, params_list)
+            ]
+            
+            results = []
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    results.append({"error": str(e)})
+                    
+        return results
+        
+    async def async_get(self, path: str, params: Dict[str, Any] = {}) -> Any:
+        """Async version of the GET method."""
+        await self.async_rate_limit()
+        
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            self.thread_executor,
+            lambda: self._session.get(
+                self.host + path,
+                headers=self.request_headers("GET", path),
+                params=params
+            )
+        )
+        
+        self.raise_if_bad_response(response)
+        return response.json()
+        
+    async def async_batch_get(self, paths: List[str], params_list: Optional[List[Dict[str, Any]]] = None) -> List[Any]:
+        """Performs multiple GET requests in parallel using asyncio.
+        
+        Args:
+            paths: List of API paths to request
+            params_list: Optional list of params dictionaries for each request
+        
+        Returns:
+            List of API responses
+        """
+        if params_list is None:
+            params_list = [{} for _ in paths]
+            
+        if len(paths) != len(params_list):
+            raise ValueError("paths and params_list must have the same length")
+            
+        tasks = [
+            self.async_get(path, params)
+            for path, params in zip(paths, params_list)
+        ]
+        
+        return await asyncio.gather(*tasks, return_exceptions=True)
 
     def get_balance(self) -> Dict[str, Any]:
         """Retrieves the account balance."""
@@ -202,7 +301,54 @@ class KalshiHttpClient(KalshiBaseClient):
         }
         # Remove None values
         params = {k: v for k, v in params.items() if v is not None}
-        return self.get(self.events_url, params=params)
+        response = self.get(self.events_url, params=params)
+        
+        # Add cursor to response if it exists in headers
+        if 'cursor' in response:
+            return response
+        elif 'next_cursor' in response:
+            response['cursor'] = response['next_cursor']
+            return response
+        else:
+            response['cursor'] = None
+            return response
+        
+    def get_markets_batch(self, tickers: List[str]) -> List[Dict[str, Any]]:
+        """Retrieve multiple markets in parallel.
+        
+        Args:
+            tickers: List of market ticker symbols
+            
+        Returns:
+            List of market details dictionaries
+        """
+        paths = [f"{self.markets_url}/{ticker}" for ticker in tickers]
+        results = self.batch_get(paths)
+        
+        # Extract the 'market' field from each result
+        return [r.get('market', r) for r in results]
+        
+    async def get_markets_async(self, tickers: List[str]) -> List[Dict[str, Any]]:
+        """Retrieve multiple markets in parallel using async.
+        
+        Args:
+            tickers: List of market ticker symbols
+            
+        Returns:
+            List of market details dictionaries
+        """
+        paths = [f"{self.markets_url}/{ticker}" for ticker in tickers]
+        results = await self.async_batch_get(paths)
+        
+        # Extract the 'market' field from each result and handle exceptions
+        markets = []
+        for r in results:
+            if isinstance(r, Exception):
+                markets.append({"error": str(r)})
+            else:
+                markets.append(r.get('market', r))
+        
+        return markets
 
     def get_market(self, ticker: str) -> Dict[str, Any]:
         """Retrieves detailed information about a specific market.
@@ -222,34 +368,62 @@ class KalshiWebSocketClient(KalshiBaseClient):
         key_id: str,
         private_key: rsa.RSAPrivateKey,
         environment: Environment = Environment.DEMO,
+        max_workers: int = 10,
     ):
-        super().__init__(key_id, private_key, environment)
+        super().__init__(key_id, private_key, environment, max_workers)
         self.ws = None
         self.url_suffix = "/trade-api/ws/v2"
         self.message_id = 1  # Add counter for message IDs
+        self.reconnect_delay = 1  # Initial reconnect delay in seconds
+        self.max_reconnect_delay = 30  # Maximum reconnect delay
+        self.message_handlers = []  # List of message handler callbacks
 
-    async def connect(self):
+    async def connect(self, auto_reconnect=True):
         """Establishes a WebSocket connection using authentication."""
         host = self.WS_BASE_URL + self.url_suffix
         auth_headers = self.request_headers("GET", self.url_suffix)
-        async with websockets.connect(host, additional_headers=auth_headers) as websocket:
-            self.ws = websocket
-            await self.on_open()
-            await self.handler()
+        
+        while True:
+            try:
+                async with websockets.connect(host, additional_headers=auth_headers) as websocket:
+                    self.ws = websocket
+                    self.reconnect_delay = 1  # Reset reconnect delay on successful connection
+                    await self.on_open()
+                    await self.handler()
+            except Exception as e:
+                await self.on_error(e)
+                
+                if not auto_reconnect:
+                    break
+                    
+                # Exponential backoff for reconnect
+                print(f"Reconnecting in {self.reconnect_delay} seconds...")
+                await asyncio.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, self.max_reconnect_delay)
+
+    def add_message_handler(self, handler: Callable[[dict], None]):
+        """Add a callback function to handle incoming messages."""
+        self.message_handlers.append(handler)
 
     async def on_open(self):
         """Callback when WebSocket connection is opened."""
         print("WebSocket connection opened.")
         await self.subscribe_to_tickers()
 
-    async def subscribe_to_tickers(self):
-        """Subscribe to ticker updates for all markets."""
+    async def subscribe_to_tickers(self, tickers=None):
+        """Subscribe to ticker updates for markets.
+        
+        Args:
+            tickers: Optional list of specific tickers to subscribe to. If None, subscribes to all.
+        """
+        params = {"channels": ["ticker"]}
+        if tickers:
+            params["tickers"] = tickers
+            
         subscription_message = {
             "id": self.message_id,
             "cmd": "subscribe",
-            "params": {
-                "channels": ["ticker"]
-            }
+            "params": params
         }
         await self.ws.send(json.dumps(subscription_message))
         self.message_id += 1
@@ -266,6 +440,21 @@ class KalshiWebSocketClient(KalshiBaseClient):
 
     async def on_message(self, message):
         """Callback for handling incoming messages."""
+        try:
+            data = json.loads(message)
+            
+            # Process with all registered handlers
+            for handler in self.message_handlers:
+                # Run handlers in executor to avoid blocking the event loop
+                await asyncio.get_event_loop().run_in_executor(
+                    self.thread_executor, 
+                    handler, 
+                    data
+                )
+        except Exception as e:
+            print(f"Error processing message: {e}")
+        
+        # For backward compatibility
         print("Received message:", message)
 
     async def on_error(self, error):
