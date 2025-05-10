@@ -95,6 +95,7 @@ class KalshiHttpClient(KalshiBaseClient):
         self.exchange_url = "/trade-api/v2/exchange"
         self.markets_url = "/trade-api/v2/markets"
         self.portfolio_url = "/trade-api/v2/portfolio"
+        self.events_url = "/trade-api/v2/events"
 
     def rate_limit(self) -> None:
         """Built-in rate limiter to prevent exceeding API rate limits."""
@@ -171,6 +172,48 @@ class KalshiHttpClient(KalshiBaseClient):
         # Remove None values
         params = {k: v for k, v in params.items() if v is not None}
         return self.get(self.markets_url + '/trades', params=params)
+
+    def get_events(
+        self,
+        status: Optional[str] = None,
+        series_ticker: Optional[str] = None,
+        with_nested_markets: bool = True,
+        limit: int = 100,
+        cursor: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Retrieves events based on provided filters.
+        
+        Args:
+            status: Comma separated list of statuses (unopened, open, closed, settled)
+            series_ticker: Series ticker to retrieve contracts for
+            with_nested_markets: Include nested market data in response
+            limit: Number of results per page (1-200)
+            cursor: Pagination cursor from previous request
+            
+        Returns:
+            Dict containing events data and pagination cursor
+        """
+        params = {
+            'status': status,
+            'series_ticker': series_ticker,
+            'with_nested_markets': str(with_nested_markets).lower(),
+            'limit': limit,
+            'cursor': cursor,
+        }
+        # Remove None values
+        params = {k: v for k, v in params.items() if v is not None}
+        return self.get(self.events_url, params=params)
+
+    def get_market(self, ticker: str) -> Dict[str, Any]:
+        """Retrieves detailed information about a specific market.
+        
+        Args:
+            ticker: Market ticker symbol
+            
+        Returns:
+            Dict containing market details
+        """
+        return self.get(f"{self.markets_url}/{ticker}")
 
 class KalshiWebSocketClient(KalshiBaseClient):
     """Client for handling WebSocket connections to the Kalshi API."""
