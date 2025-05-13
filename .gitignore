@@ -51,3 +51,5 @@ ENV/
 *.csr.pem
 *.csr.pem.crt
 *.csr.pem.key
+
+.env

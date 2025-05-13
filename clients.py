@@ -7,6 +7,7 @@ from enum import Enum
 import json
 import asyncio
 import concurrent.futures
+import random
 
 from requests.exceptions import HTTPError
 
@@ -97,7 +98,8 @@ class KalshiHttpClient(KalshiBaseClient):
         private_key: rsa.RSAPrivateKey,
         environment: Environment = Environment.DEMO,
         max_workers: int = 10,
-        rate_limit_ms: int = 50  # More aggressive rate limit
+        rate_limit_per_second: int = 8,  # Default to slightly under Basic tier's 10 reads/second
+        adaptive_rate_limiting: bool = True
     ):
         super().__init__(key_id, private_key, environment, max_workers)
         self.host = self.HTTP_BASE_URL
@@ -105,34 +107,61 @@ class KalshiHttpClient(KalshiBaseClient):
         self.markets_url = "/trade-api/v2/markets"
         self.portfolio_url = "/trade-api/v2/portfolio"
         self.events_url = "/trade-api/v2/events"
-        self.rate_limit_ms = rate_limit_ms
-        self._session = requests.Session()  # Use a session for connection pooling
+        self.rate_limit_per_second = rate_limit_per_second
+        self.adaptive_rate_limiting = adaptive_rate_limiting
+        
+        # Configure session with connection pooling for better performance
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=max_workers,
+            pool_maxsize=max_workers * 2,
+            max_retries=3
+        )
+        self._session.mount('http://', adapter)
+        self._session.mount('https://', adapter)
+        
         self._last_requests = []  # Track the timestamps of last N requests
+        self._request_times_lock = asyncio.Lock() if asyncio.get_event_loop_policy().get_event_loop().is_running() else None
 
     def _adaptive_rate_limit(self) -> None:
-        """Adaptive rate limiter that adjusts based on recent request history."""
+        """Adaptive rate limiter that adjusts based on recent request history and configured limits."""
         now = datetime.now()
+        
         # Keep only timestamps from the last second
         self._last_requests = [ts for ts in self._last_requests if (now - ts).total_seconds() < 1.0]
         
         # Add current timestamp
         self._last_requests.append(now)
         
-        # If we have more than 15 requests in the last second, slow down
-        if len(self._last_requests) > 15:
-            time.sleep(self.rate_limit_ms / 1000)
+        # If we have more than our rate limit in the last second, sleep to respect the limit
+        if len(self._last_requests) > self.rate_limit_per_second:
+            sleep_time = max(0, 1.0 - (now - self._last_requests[0]).total_seconds())
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
     async def async_rate_limit(self) -> None:
         """Asynchronous rate limiter for use with async functions."""
-        if self.rate_limit_lock:
-            async with self.rate_limit_lock:
-                self._adaptive_rate_limit()
+        if self._request_times_lock:
+            async with self._request_times_lock:
+                if self.adaptive_rate_limiting:
+                    self._adaptive_rate_limit()
+                else:
+                    # Simple rate limiting - space requests evenly
+                    await asyncio.sleep(1.0 / self.rate_limit_per_second)
         else:
-            self._adaptive_rate_limit()
+            if self.adaptive_rate_limiting:
+                self._adaptive_rate_limit()
+            else:
+                # Simple rate limiting - space requests evenly
+                time.sleep(1.0 / self.rate_limit_per_second)
 
     def rate_limit(self) -> None:
         """Non-async version of rate limiter."""
-        self._adaptive_rate_limit()
+        if self.adaptive_rate_limiting:
+            self._adaptive_rate_limit()
+        else:
+            # Simple rate limiting - space requests evenly
+            time.sleep(1.0 / self.rate_limit_per_second)
 
     def raise_if_bad_response(self, response: requests.Response) -> None:
         """Raises an HTTPError if the response status code indicates an error."""
@@ -204,25 +233,43 @@ class KalshiHttpClient(KalshiBaseClient):
                     
         return results
         
-    async def async_get(self, path: str, params: Dict[str, Any] = {}) -> Any:
-        """Async version of the GET method."""
+    async def async_get(self, path: str, params: Dict[str, Any] = {}, retries: int = 3) -> Any:
+        """Async version of the GET method with retry logic."""
         await self.async_rate_limit()
         
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(
-            self.thread_executor,
-            lambda: self._session.get(
-                self.host + path,
-                headers=self.request_headers("GET", path),
-                params=params
-            )
-        )
+        attempt = 0
+        last_error = None
+
+        while attempt < retries:
+            try:
+                response = await loop.run_in_executor(
+                    self.thread_executor,
+                    lambda: self._session.get(
+                        self.host + path,
+                        headers=self.request_headers("GET", path),
+                        params=params,
+                        timeout=(3.0, 10.0)  # (connect timeout, read timeout)
+                    )
+                )
+                
+                self.raise_if_bad_response(response)
+                return response.json()
+            except (requests.RequestException, HTTPError) as e:
+                attempt += 1
+                last_error = e
+                if attempt < retries:
+                    # Exponential backoff with jitter
+                    backoff = 0.1 * (2 ** attempt) + (random.random() * 0.1)
+                    await asyncio.sleep(backoff)
         
-        self.raise_if_bad_response(response)
-        return response.json()
+        # If we get here, all retries failed
+        if last_error:
+            return {"error": str(last_error)}
+        return {"error": "Unknown error during request"}
         
     async def async_batch_get(self, paths: List[str], params_list: Optional[List[Dict[str, Any]]] = None) -> List[Any]:
-        """Performs multiple GET requests in parallel using asyncio.
+        """Performs multiple GET requests in parallel using asyncio with concurrency control.
         
         Args:
             paths: List of API paths to request
@@ -236,9 +283,17 @@ class KalshiHttpClient(KalshiBaseClient):
             
         if len(paths) != len(params_list):
             raise ValueError("paths and params_list must have the same length")
-            
+        
+        # Set max concurrent tasks but not more than we have workers
+        # This prevents overwhelming the connection pool or the API
+        semaphore = asyncio.Semaphore(min(20, self.max_workers))
+        
+        async def fetch_with_semaphore(path, params):
+            async with semaphore:
+                return await self.async_get(path, params)
+        
         tasks = [
-            self.async_get(path, params)
+            fetch_with_semaphore(path, params)
             for path, params in zip(paths, params_list)
         ]
         

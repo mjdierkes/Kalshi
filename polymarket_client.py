@@ -11,6 +11,7 @@ import concurrent.futures
 from tqdm import tqdm
 import time
 from functools import lru_cache
+import threading
 
 # Load environment variables
 load_dotenv()
@@ -128,6 +129,39 @@ def process_market_details(client: ClobClient, market: Dict) -> Dict:
     market_result['details'] = get_market_details(client, market)
     return market_result
 
+def get_market_row(market: Dict) -> Dict:
+    """Convert a market to a row for CSV export"""
+    if 'tokens' not in market or len(market['tokens']) != 2:
+        return None
+        
+    # Get details
+    details = market.get('details', {})
+    
+    # Calculate total volumes
+    total_bid_volume = sum(float(bid['size']) for bid in details.get('order_book', {}).get('bids', []))
+    total_ask_volume = sum(float(ask['size']) for ask in details.get('order_book', {}).get('asks', []))
+    
+    return {
+        'Market Type': get_market_type(market),
+        'Title': market.get('title', ''),
+        'Question': market.get('question', ''),
+        'Status': get_market_status(market),
+        'Outcome 1': market['tokens'][0]['outcome'],
+        'Price 1': market['tokens'][0]['price'],
+        'Outcome 2': market['tokens'][1]['outcome'],
+        'Price 2': market['tokens'][1]['price'],
+        'Market ID': market.get('market_id', ''),
+        'Created At': market.get('created_at', ''),
+        'Updated At': market.get('updated_at', ''),
+        'Mid Price': details.get('mid_price'),
+        'Last Trade Price': details.get('last_trade_price'),
+        'Spread': details.get('spread'),
+        'Order Book Bids': json.dumps(details.get('order_book', {}).get('bids', [])),
+        'Order Book Asks': json.dumps(details.get('order_book', {}).get('asks', [])),
+        'Total Bid Volume': total_bid_volume,
+        'Total Ask Volume': total_ask_volume
+    }
+
 def export_markets_to_csv(markets: List[Dict], filename: str):
     """Export markets data to a CSV file"""
     fieldnames = [
@@ -156,34 +190,9 @@ def export_markets_to_csv(markets: List[Dict], filename: str):
         writer.writeheader()
         
         for market in markets:
-            if 'tokens' in market and len(market['tokens']) == 2:
-                # Get details
-                details = market.get('details', {})
-                
-                # Calculate total volumes
-                total_bid_volume = sum(float(bid['size']) for bid in details.get('order_book', {}).get('bids', []))
-                total_ask_volume = sum(float(ask['size']) for ask in details.get('order_book', {}).get('asks', []))
-                
-                writer.writerow({
-                    'Market Type': get_market_type(market),
-                    'Title': market.get('title', ''),
-                    'Question': market.get('question', ''),
-                    'Status': get_market_status(market),
-                    'Outcome 1': market['tokens'][0]['outcome'],
-                    'Price 1': market['tokens'][0]['price'],
-                    'Outcome 2': market['tokens'][1]['outcome'],
-                    'Price 2': market['tokens'][1]['price'],
-                    'Market ID': market.get('market_id', ''),
-                    'Created At': market.get('created_at', ''),
-                    'Updated At': market.get('updated_at', ''),
-                    'Mid Price': details.get('mid_price'),
-                    'Last Trade Price': details.get('last_trade_price'),
-                    'Spread': details.get('spread'),
-                    'Order Book Bids': json.dumps(details.get('order_book', {}).get('bids', [])),
-                    'Order Book Asks': json.dumps(details.get('order_book', {}).get('asks', [])),
-                    'Total Bid Volume': total_bid_volume,
-                    'Total Ask Volume': total_ask_volume
-                })
+            row = get_market_row(market)
+            if row:
+                writer.writerow(row)
 
 def fetch_markets_batch(client: ClobClient, cursor: str, batch_size: int = 50):
     """Fetch a batch of markets starting from a cursor"""
@@ -212,6 +221,47 @@ def list_markets():
         
         print(f"Found approximately {markets_count} markets")
         
+        # Create CSV file at the beginning
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_filename = f"polymarket_markets_{timestamp}.csv"
+        print(f"Will save market data to {csv_filename} as processing occurs")
+        
+        # Set up CSV writer
+        fieldnames = [
+            'Market Type',
+            'Title',
+            'Question',
+            'Status',
+            'Outcome 1',
+            'Price 1',
+            'Outcome 2',
+            'Price 2',
+            'Market ID',
+            'Created At',
+            'Updated At',
+            'Mid Price',
+            'Last Trade Price',
+            'Spread',
+            'Order Book Bids',
+            'Order Book Asks',
+            'Total Bid Volume',
+            'Total Ask Volume'
+        ]
+        
+        csvfile = open(csv_filename, 'w', newline='', encoding='utf-8')
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        
+        # Create a lock for thread-safe CSV writing
+        csv_lock = threading.Lock()
+        
+        # Write market to CSV function
+        def write_market_to_csv(market):
+            row = get_market_row(market)
+            if row:
+                with csv_lock:
+                    writer.writerow(row)
+        
         # Create a single progress bar for the entire process
         with tqdm(total=markets_count*2, desc="Fetching and processing markets") as pbar:
             # Fetch all markets
@@ -226,7 +276,7 @@ def list_markets():
             # On M2 with 32GB RAM, we can use a higher number of workers
             max_workers = min(32, os.cpu_count() * 4)  # Adjust based on your needs
             
-            # Process markets in parallel
+            # Process markets in parallel and save as we go
             processed_markets = []
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 # Submit all tasks
@@ -239,14 +289,15 @@ def list_markets():
                 for future in concurrent.futures.as_completed(future_to_market):
                     processed_market = future.result()
                     processed_markets.append(processed_market)
+                    
+                    # Write to CSV as soon as processed
+                    write_market_to_csv(processed_market)
+                    
                     pbar.update(1)
         
-        # Export to CSV
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        csv_filename = f"polymarket_markets_{timestamp}.csv"
-        print(f"\nExporting market data to {csv_filename}")
-        export_markets_to_csv(processed_markets, csv_filename)
-        print(f"Export complete!")
+        # Close CSV file
+        csvfile.close()
+        print(f"CSV export complete: {csv_filename}")
             
         # Group markets by type and status
         active_markets = {'Binary': [], 'Sports': [], 'Crypto': [], 'Other': []}
